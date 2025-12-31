@@ -26,7 +26,7 @@ optional = true
 
 [tool.poetry.group.app.dependencies]
 simplemma = "^1.0.0"
-gradio = "4.37.2"
+gradio = "4.31.5"
 python-docx = "^1.1.2"
 PyMuPDF = "^1.24.7"
 

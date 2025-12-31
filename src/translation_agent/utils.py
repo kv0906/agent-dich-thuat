@@ -1,5 +1,6 @@
+import base64
 import os
-from typing import List, Union
+from typing import List, Optional, Union
 
 import openai
 import tiktoken
@@ -9,6 +10,87 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 load_dotenv()  # read local .env file
+
+# Provider configurations
+PROVIDERS = {
+    "zai": {
+        "api_key": os.getenv("ZAI_API_KEY"),
+        "base_url": os.getenv("ZAI_BASE_URL"),
+        "model": os.getenv("ZAI_MODEL", "zai-default"),
+    },
+    "deepseek": {
+        "api_key": os.getenv("DEEPSEEK_API_KEY"),
+        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        "model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+    },
+    "deepseek_ocr": {
+        "api_key": os.getenv("DEEPSEEK_OCR_API_KEY", os.getenv("DEEPSEEK_API_KEY")),
+        "base_url": os.getenv("DEEPSEEK_OCR_BASE_URL", "https://api.deepseek.com"),
+        "model": os.getenv("DEEPSEEK_OCR_MODEL", "deepseek-chat"),
+    },
+    "gemini": {
+        "api_key": os.getenv("GEMINI_API_KEY"),
+        "base_url": os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"),
+        "model": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+    },
+    "openai": {
+        "api_key": os.getenv("OPENAI_API_KEY"),
+        "base_url": None,
+        "model": os.getenv("OPENAI_MODEL", "gpt-4-turbo"),
+    },
+}
+
+# Language to provider mapping (Chinese-focused)
+# Priority: zai > deepseek for Chinese translation
+LANGUAGE_PROVIDER_MAP = {
+    "chinese": "deepseek",
+    "中文": "deepseek",
+    "mandarin": "deepseek",
+    "simplified chinese": "deepseek",
+    "简体中文": "deepseek",
+    "traditional chinese": "deepseek",
+    "繁體中文": "deepseek",
+    "cantonese": "deepseek",
+    "粤语": "deepseek",
+    "english": "gemini",
+}
+
+# Thread-local storage for current source language
+_current_source_lang: Optional[str] = None
+
+
+def get_provider_for_language(source_lang: str) -> str:
+    """Get the appropriate provider based on source language."""
+    lang_lower = source_lang.lower()
+    return LANGUAGE_PROVIDER_MAP.get(lang_lower, "openai")
+
+
+def get_client_and_model(source_lang: Optional[str] = None) -> tuple:
+    """Get the appropriate OpenAI client and model based on source language."""
+    global _current_source_lang
+    
+    if source_lang:
+        _current_source_lang = source_lang
+    
+    lang = _current_source_lang or "english"
+    provider_name = get_provider_for_language(lang)
+    provider = PROVIDERS[provider_name]
+    
+    if not provider["api_key"]:
+        ic(f"Warning: {provider_name} API key not set, falling back to OpenAI")
+        provider = PROVIDERS["openai"]
+        provider_name = "openai"
+    
+    ic(f"Using provider: {provider_name} for source language: {lang}")
+    
+    client = openai.OpenAI(
+        api_key=provider["api_key"],
+        base_url=provider["base_url"],
+    )
+    return client, provider["model"]
+
+
+# Default client for backward compatibility
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 MAX_TOKENS_PER_CHUNK = (
@@ -17,22 +99,139 @@ MAX_TOKENS_PER_CHUNK = (
 # discrete chunks to translate one chunk at a time
 
 
+def get_ocr_client() -> tuple:
+    """Get the DeepSeek OCR client and model."""
+    provider = PROVIDERS["deepseek_ocr"]
+    
+    if not provider["api_key"]:
+        raise ValueError("DeepSeek OCR API key not configured. Set DEEPSEEK_OCR_API_KEY or DEEPSEEK_API_KEY in .env")
+    
+    client = openai.OpenAI(
+        api_key=provider["api_key"],
+        base_url=provider["base_url"],
+    )
+    return client, provider["model"]
+
+
+def extract_text_from_image(
+    image_path: str,
+    language_hint: str = "chinese",
+) -> str:
+    """
+    Extract text from an image using DeepSeek OCR (Vision Language Model).
+    
+    Args:
+        image_path: Path to the image file (supports PNG, JPG, JPEG, etc.)
+        language_hint: Hint about the primary language in the image (default: chinese)
+    
+    Returns:
+        Extracted text from the image.
+    """
+    ocr_client, ocr_model = get_ocr_client()
+    
+    with open(image_path, "rb") as f:
+        image_data = base64.b64encode(f.read()).decode("utf-8")
+    
+    ext = image_path.lower().split(".")[-1]
+    mime_type = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "gif": "image/gif",
+        "webp": "image/webp",
+    }.get(ext, "image/png")
+    
+    system_message = f"""You are an expert OCR system specialized in extracting text from images.
+Focus on {language_hint} text extraction. Extract ALL text visible in the image accurately.
+Preserve the original formatting and structure as much as possible.
+Output only the extracted text, nothing else."""
+
+    response = ocr_client.chat.completions.create(
+        model=ocr_model,
+        messages=[
+            {"role": "system", "content": system_message},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{image_data}"
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": f"Extract all {language_hint} and other text from this image. Preserve formatting.",
+                    },
+                ],
+            },
+        ],
+        temperature=0.1,
+    )
+    
+    return response.choices[0].message.content
+
+
+def extract_text_from_image_url(
+    image_url: str,
+    language_hint: str = "chinese",
+) -> str:
+    """
+    Extract text from an image URL using DeepSeek OCR.
+    
+    Args:
+        image_url: URL of the image.
+        language_hint: Hint about the primary language in the image (default: chinese)
+    
+    Returns:
+        Extracted text from the image.
+    """
+    ocr_client, ocr_model = get_ocr_client()
+    
+    system_message = f"""You are an expert OCR system specialized in extracting text from images.
+Focus on {language_hint} text extraction. Extract ALL text visible in the image accurately.
+Preserve the original formatting and structure as much as possible.
+Output only the extracted text, nothing else."""
+
+    response = ocr_client.chat.completions.create(
+        model=ocr_model,
+        messages=[
+            {"role": "system", "content": system_message},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_url},
+                    },
+                    {
+                        "type": "text",
+                        "text": f"Extract all {language_hint} and other text from this image. Preserve formatting.",
+                    },
+                ],
+            },
+        ],
+        temperature=0.1,
+    )
+    
+    return response.choices[0].message.content
+
+
 def get_completion(
     prompt: str,
     system_message: str = "You are a helpful assistant.",
-    model: str = "gpt-4-turbo",
+    model: Optional[str] = None,
     temperature: float = 0.3,
     json_mode: bool = False,
 ) -> Union[str, dict]:
     """
-        Generate a completion using the OpenAI API.
+        Generate a completion using the appropriate LLM provider.
 
     Args:
         prompt (str): The user's prompt or query.
         system_message (str, optional): The system message to set the context for the assistant.
             Defaults to "You are a helpful assistant.".
-        model (str, optional): The name of the OpenAI model to use for generating the completion.
-            Defaults to "gpt-4-turbo".
+        model (str, optional): The name of the model to use. If None, uses provider's default.
         temperature (float, optional): The sampling temperature for controlling the randomness of the generated text.
             Defaults to 0.3.
         json_mode (bool, optional): Whether to return the response in JSON format.
@@ -43,10 +242,12 @@ def get_completion(
             If json_mode is True, returns the complete API response as a dictionary.
             If json_mode is False, returns the generated text as a string.
     """
+    current_client, default_model = get_client_and_model()
+    use_model = model or default_model
 
     if json_mode:
-        response = client.chat.completions.create(
-            model=model,
+        response = current_client.chat.completions.create(
+            model=use_model,
             temperature=temperature,
             top_p=1,
             response_format={"type": "json_object"},
@@ -57,8 +258,8 @@ def get_completion(
         )
         return response.choices[0].message.content
     else:
-        response = client.chat.completions.create(
-            model=model,
+        response = current_client.chat.completions.create(
+            model=use_model,
             temperature=temperature,
             top_p=1,
             messages=[
@@ -639,7 +840,18 @@ def translate(
     country,
     max_tokens=MAX_TOKENS_PER_CHUNK,
 ):
-    """Translate the source_text from source_lang to target_lang."""
+    """Translate the source_text from source_lang to target_lang.
+    
+    Provider selection based on source language:
+    - Chinese/中文/Mandarin → Z.ai
+    - English → Google Gemini
+    - Other → OpenAI (fallback)
+    """
+    global _current_source_lang
+    _current_source_lang = source_lang
+    
+    provider = get_provider_for_language(source_lang)
+    ic(f"Translation: {source_lang} → {target_lang} using {provider}")
 
     num_tokens_in_text = num_tokens_in_string(source_text)
 

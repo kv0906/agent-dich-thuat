@@ -1,62 +1,67 @@
 import os
 import time
+import logging
 from functools import wraps
 from threading import Lock
 from typing import Optional, Union
 
-import gradio as gr
 import openai
 import translation_agent.utils as utils
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 
 RPM = 60
-MODEL = ""
+MODEL = "deepseek-chat"
 TEMPERATURE = 0.3
-# Hide js_mode in UI now, update in plan.
-JS_MODE = False
-ENDPOINT = ""
+MAX_RETRIES = 3
+RETRY_DELAY_BASE = 2.0  # Base delay in seconds for exponential backoff
 
 
-# Add your LLMs here
+class TranslationAPIError(Exception):
+    """Raised when API call fails after all retries."""
+    def __init__(self, message: str, original_error: Exception = None, is_retryable: bool = True):
+        super().__init__(message)
+        self.original_error = original_error
+        self.is_retryable = is_retryable
+
+
 def model_load(
-    endpoint: str,
-    base_url: str,
-    model: str,
     api_key: Optional[str] = None,
     temperature: float = TEMPERATURE,
     rpm: int = RPM,
-    js_mode: bool = JS_MODE,
 ):
-    global client, RPM, MODEL, TEMPERATURE, JS_MODE, ENDPOINT
-    ENDPOINT = endpoint
+    """Load the DeepSeek model."""
+    global client, RPM, MODEL, TEMPERATURE
     RPM = rpm
-    MODEL = model
     TEMPERATURE = temperature
-    JS_MODE = js_mode
 
-    match endpoint:
-        case "OpenAI":
-            client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        case "Groq":
-            client = openai.OpenAI(
-                api_key=api_key if api_key else os.getenv("GROQ_API_KEY"),
-                base_url="https://api.groq.com/openai/v1",
-            )
-        case "TogetherAI":
-            client = openai.OpenAI(
-                api_key=api_key if api_key else os.getenv("TOGETHER_API_KEY"),
-                base_url="https://api.together.xyz/v1",
-            )
-        case "CUSTOM":
-            client = openai.OpenAI(api_key=api_key, base_url=base_url)
-        case "Ollama":
-            client = openai.OpenAI(
-                api_key="ollama", base_url="http://localhost:11434/v1"
-            )
-        case _:
-            client = openai.OpenAI(
-                api_key=api_key if api_key else os.getenv("OPENAI_API_KEY")
-            )
+    logger.info("🔧 Initializing DeepSeek client...")
+    
+    api_key_to_use = api_key if api_key else os.getenv("DEEPSEEK_API_KEY")
+    if not api_key_to_use:
+        logger.error("❌ No API key provided")
+        raise ValueError(
+            "DeepSeek API key is required. Either enter it in the field or set DEEPSEEK_API_KEY environment variable."
+        )
+
+    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    client = openai.OpenAI(
+        api_key=api_key_to_use,
+        base_url=base_url,
+    )
+    
+    logger.info(f"   ✅ Client initialized")
+    logger.info(f"   📍 Base URL: {base_url}")
+    logger.info(f"   🤖 Model: {MODEL}")
+    logger.info(f"   🌡️  Temperature: {TEMPERATURE}")
+    logger.info(f"   ⚡ Rate limit: {RPM} requests/min")
 
 
 def rate_limit(get_max_per_minute):
@@ -84,67 +89,127 @@ def rate_limit(get_max_per_minute):
     return decorator
 
 
+def _is_retryable_error(e: Exception) -> bool:
+    """Check if an error is retryable."""
+    if isinstance(e, openai.RateLimitError):
+        return True
+    if isinstance(e, openai.APITimeoutError):
+        return True
+    if isinstance(e, openai.APIConnectionError):
+        return True
+    if isinstance(e, openai.InternalServerError):
+        return True
+    if isinstance(e, openai.APIStatusError):
+        return e.status_code >= 500
+    return False
+
+
+def _get_retry_delay(attempt: int, error: Exception) -> float:
+    """Get delay before next retry with exponential backoff."""
+    base_delay = RETRY_DELAY_BASE * (2 ** attempt)
+    
+    if isinstance(error, openai.RateLimitError):
+        return max(base_delay, 10.0)
+    
+    return min(base_delay, 30.0)
+
+
 @rate_limit(lambda: RPM)
 def get_completion(
     prompt: str,
     system_message: str = "You are a helpful assistant.",
-    model: str = "gpt-4-turbo",
+    model: str = "deepseek-chat",
     temperature: float = 0.3,
     json_mode: bool = False,
 ) -> Union[str, dict]:
     """
-        Generate a completion using the OpenAI API.
+    Generate a completion using the DeepSeek API with automatic retry.
 
     Args:
         prompt (str): The user's prompt or query.
         system_message (str, optional): The system message to set the context for the assistant.
-            Defaults to "You are a helpful assistant.".
-        model (str, optional): The name of the OpenAI model to use for generating the completion.
-            Defaults to "gpt-4-turbo".
-        temperature (float, optional): The sampling temperature for controlling the randomness of the generated text.
-            Defaults to 0.3.
+        model (str, optional): The model name (ignored, uses deepseek-chat).
+        temperature (float, optional): The sampling temperature.
         json_mode (bool, optional): Whether to return the response in JSON format.
-            Defaults to False.
 
     Returns:
         Union[str, dict]: The generated completion.
-            If json_mode is True, returns the complete API response as a dictionary.
-            If json_mode is False, returns the generated text as a string.
+    
+    Raises:
+        TranslationAPIError: When API call fails after all retries.
     """
-
     model = MODEL
     temperature = TEMPERATURE
-    json_mode = JS_MODE
-
-    if json_mode:
+    
+    last_error = None
+    prompt_preview = prompt[:100].replace('\n', ' ') + "..." if len(prompt) > 100 else prompt.replace('\n', ' ')
+    
+    for attempt in range(MAX_RETRIES):
         try:
-            response = client.chat.completions.create(
-                model=model,
-                temperature=temperature,
-                top_p=1,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": system_message},
-                    {"role": "user", "content": prompt},
-                ],
-            )
-            return response.choices[0].message.content
+            if attempt > 0:
+                logger.warning(f"   🔄 Retry attempt {attempt + 1}/{MAX_RETRIES}")
+            
+            call_start = time.time()
+            
+            if json_mode:
+                response = client.chat.completions.create(
+                    model=model,
+                    temperature=temperature,
+                    top_p=1,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": system_message},
+                        {"role": "user", "content": prompt},
+                    ],
+                    timeout=60.0,
+                )
+            else:
+                response = client.chat.completions.create(
+                    model=model,
+                    temperature=temperature,
+                    top_p=1,
+                    messages=[
+                        {"role": "system", "content": system_message},
+                        {"role": "user", "content": prompt},
+                    ],
+                    timeout=60.0,
+                )
+            
+            call_duration = time.time() - call_start
+            result = response.choices[0].message.content
+            
+            # Log token usage if available
+            if hasattr(response, 'usage') and response.usage:
+                usage = response.usage
+                logger.debug(f"   📊 Tokens - Input: {usage.prompt_tokens}, Output: {usage.completion_tokens}, Total: {usage.total_tokens}")
+            
+            logger.debug(f"   ⚡ API call completed in {call_duration:.2f}s")
+            
+            return result
+        
         except Exception as e:
-            raise gr.Error(f"An unexpected error occurred: {e}") from e
-    else:
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                temperature=temperature,
-                top_p=1,
-                messages=[
-                    {"role": "system", "content": system_message},
-                    {"role": "user", "content": prompt},
-                ],
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            raise gr.Error(f"An unexpected error occurred: {e}") from e
+            last_error = e
+            
+            if not _is_retryable_error(e):
+                logger.error(f"   ❌ Non-retryable API error: {type(e).__name__}: {e}")
+                raise TranslationAPIError(
+                    f"API error (non-retryable): {e}",
+                    original_error=e,
+                    is_retryable=False,
+                )
+            
+            if attempt < MAX_RETRIES - 1:
+                delay = _get_retry_delay(attempt, e)
+                logger.warning(f"   ⚠️ Retryable error: {type(e).__name__}. Waiting {delay:.1f}s before retry...")
+                time.sleep(delay)
+            else:
+                error_type = type(e).__name__
+                logger.error(f"   ❌ API error after {MAX_RETRIES} retries: {error_type}: {e}")
+                raise TranslationAPIError(
+                    f"API error after {MAX_RETRIES} retries ({error_type}): {e}",
+                    original_error=last_error,
+                    is_retryable=True,
+                )
 
 
 utils.get_completion = get_completion
