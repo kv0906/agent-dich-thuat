@@ -1,12 +1,14 @@
+import logging
 import os
 import time
-import logging
 from functools import wraps
 from threading import Lock
 from typing import Optional, Union
 
+import httpx
 import openai
 import translation_agent.utils as utils
+
 
 # Configure logging
 logging.basicConfig(
@@ -22,6 +24,7 @@ MODEL = "deepseek-chat"
 TEMPERATURE = 0.3
 MAX_RETRIES = 3
 RETRY_DELAY_BASE = 2.0  # Base delay in seconds for exponential backoff
+API_TIMEOUT = 120.0  # Timeout in seconds for API calls
 
 
 class TranslationAPIError(Exception):
@@ -52,16 +55,24 @@ def model_load(
         )
 
     base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    
+    # Create httpx client with explicit timeout
+    http_client = httpx.Client(
+        timeout=httpx.Timeout(API_TIMEOUT, connect=30.0)
+    )
+    
     client = openai.OpenAI(
         api_key=api_key_to_use,
         base_url=base_url,
+        http_client=http_client,
     )
     
-    logger.info(f"   ✅ Client initialized")
+    logger.info("   ✅ Client initialized")
     logger.info(f"   📍 Base URL: {base_url}")
     logger.info(f"   🤖 Model: {MODEL}")
     logger.info(f"   🌡️  Temperature: {TEMPERATURE}")
     logger.info(f"   ⚡ Rate limit: {RPM} requests/min")
+    logger.info(f"   ⏱️  Timeout: {API_TIMEOUT}s")
 
 
 def rate_limit(get_max_per_minute):
@@ -121,6 +132,7 @@ def get_completion(
     model: str = "deepseek-chat",
     temperature: float = 0.3,
     json_mode: bool = False,
+    **kwargs,  # Accept extra args like source_lang (ignored - we always use DeepSeek)
 ) -> Union[str, dict]:
     """
     Generate a completion using the DeepSeek API with automatic retry.
@@ -131,6 +143,7 @@ def get_completion(
         model (str, optional): The model name (ignored, uses deepseek-chat).
         temperature (float, optional): The sampling temperature.
         json_mode (bool, optional): Whether to return the response in JSON format.
+        **kwargs: Extra arguments (ignored, for compatibility).
 
     Returns:
         Union[str, dict]: The generated completion.
@@ -149,6 +162,7 @@ def get_completion(
             if attempt > 0:
                 logger.warning(f"   🔄 Retry attempt {attempt + 1}/{MAX_RETRIES}")
             
+            logger.info("   🌐 Calling DeepSeek API...")
             call_start = time.time()
             
             if json_mode:
@@ -161,7 +175,6 @@ def get_completion(
                         {"role": "system", "content": system_message},
                         {"role": "user", "content": prompt},
                     ],
-                    timeout=60.0,
                 )
             else:
                 response = client.chat.completions.create(
@@ -172,7 +185,6 @@ def get_completion(
                         {"role": "system", "content": system_message},
                         {"role": "user", "content": prompt},
                     ],
-                    timeout=60.0,
                 )
             
             call_duration = time.time() - call_start
@@ -213,6 +225,15 @@ def get_completion(
 
 
 utils.get_completion = get_completion
+
+# Also patch the llm module directly since translation functions import from there
+import translation_agent.llm as llm_module
+import translation_agent.llm.completion as completion_module
+import translation_agent.translation.workflow as workflow_module
+
+llm_module.get_completion = get_completion
+completion_module.get_completion = get_completion
+workflow_module.get_completion = get_completion
 
 one_chunk_initial_translation = utils.one_chunk_initial_translation
 one_chunk_reflect_on_translation = utils.one_chunk_reflect_on_translation
